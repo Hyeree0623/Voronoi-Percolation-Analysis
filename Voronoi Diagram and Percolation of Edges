@@ -1,0 +1,330 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.spatial import Voronoi
+
+def read_lammps_dump_last_frame(dump_filename):
+    """
+    Reads the last frame of a LAMMPS dump file and extracts box dimensions, coordinates, and diameters.
+    Only includes particles with id 1 to 1000 (moving particles).
+    """
+    with open(dump_filename, 'r') as file:
+        lines = file.readlines()
+    
+    timesteps = [i for i, line in enumerate(lines) if "ITEM: TIMESTEP" in line]
+    last_timestep_idx = timesteps[-1]
+    
+    box_bounds_idx = last_timestep_idx + 5
+    x_bounds = list(map(float, lines[box_bounds_idx].split()))
+    y_bounds = list(map(float, lines[box_bounds_idx + 1].split()))
+    z_bounds = list(map(float, lines[box_bounds_idx + 2].split()))
+    box_size = [x_bounds[1] - x_bounds[0], y_bounds[1] - y_bounds[0], z_bounds[1] - z_bounds[0]]
+    
+    atom_idx = last_timestep_idx + 9
+    coordinates = []
+    diameters = []
+    ids = []
+    for line in lines[atom_idx:]:
+        if line.startswith("ITEM:"):
+            break
+        particle_id, _, x, y, z, diameter = line.split()
+        particle_id = int(particle_id)
+        if 1 <= particle_id <= 2500:
+            coordinates.append([float(x), float(y), float(z)])
+            diameters.append(float(diameter))
+            ids.append(particle_id)
+    
+    return np.array(coordinates), np.array(diameters), box_size, ids
+
+def replicate_coordinates_pbc(coordinates, box_size, replication=3):
+    """
+    Replicate coordinates for periodic boundary conditions (PBC).
+    Creates a replication x replication grid of the simulation box.
+    """
+    replicated_coords = []
+    x_shifts = np.linspace(-1, 1, replication) * box_size[0]
+    y_shifts = np.linspace(-1, 1, replication) * box_size[1]
+    for dx in x_shifts:
+        for dy in y_shifts:
+            shifted_coords = coordinates + np.array([dx, dy, 0])
+            replicated_coords.append(shifted_coords)
+    return np.vstack(replicated_coords)
+
+def voronoi_tessellation_2d(coordinates):
+    points_2d = coordinates[:, :2]
+    vor = Voronoi(points_2d)
+    return vor
+
+def plot_voronoi_with_edge_styles(vor, particle_diameters, ids, box_size=(100, 100), save_filename="voroni_diagram.pdf", figsize=(10, 10)):
+    """
+    Plot Voronoi tessellation with edge styles based on the distance between neighboring particles.
+    Solid blue line for distances larger than twice the particle diameter (2 * particle_diameter), dotted red line otherwise.
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+    blue_edges = 0
+    total_edges = 0
+
+    for ridge_vertices, ridge_points in zip(vor.ridge_vertices, vor.ridge_points):
+        ridge_vertices = np.asarray(ridge_vertices)
+        if np.all(ridge_vertices >= 0):  
+            point1, point2 = vor.points[ridge_points[0]], vor.points[ridge_points[1]]
+            dist = np.linalg.norm(point2 - point1)
+        
+            vor_point1, vor_point2 = vor.vertices[ridge_vertices]
+            avg_diameter = (particle_diameters[ridge_points[0]] + particle_diameters[ridge_points[1]]) / 2
+            if dist >= avg_diameter + 0.701:  
+                ax.plot([vor_point1[0], vor_point2[0]], [vor_point1[1], vor_point2[1]], 'b-', lw=1)
+                blue_edges += 1
+            else:  
+                ax.plot([vor_point1[0], vor_point2[0]], [vor_point1[1], vor_point2[1]], 'r--', lw=1)
+            
+            total_edges += 1
+
+    p = blue_edges / total_edges if total_edges > 0 else 0
+    print(f"Fraction of blue edges (p): {p}")
+
+    # Debugging: print particle details
+    print(f"Number of particles: {len(vor.points)}")
+    print(f"Particle IDs (or indices): {ids}")
+    print(f"Coordinates of first 10 particles:\n{vor.points[:10]}")
+    print(f"Diameters of first 10 particles:\n{particle_diameters[:10]}")
+
+    # Plot particles with sizes proportional to their diameters
+    particle_sizes = (particle_diameters/2 * 9) ** 2  # Scale diameter to marker size
+    ax.scatter(vor.points[:, 0], vor.points[:, 1], s=particle_sizes, c='k', alpha=0.7, label="Particles")
+
+    ax.set_xlim(-box_size[0] / 2, box_size[0] / 2)
+    ax.set_ylim(-box_size[1] / 2, box_size[1] / 2)
+    plt.xlabel("x", fontsize=40)
+    plt.ylabel("y", fontsize=40)
+    plt.xticks([-50, -25, 0, 25, 50], fontsize=25)
+    plt.yticks([-50, -25, 0, 25, 50], fontsize=25)
+    plt.gca().set_aspect('equal', adjustable='box')
+    plt.savefig(save_filename)
+    plt.show()
+
+import numpy as np
+from collections import defaultdict, deque
+
+def _edge_is_connected(vor, ridge_points, particle_diameters, passage_offset=0.701):
+    """Return True if the ridge (edge) is 'connected' per your passage rule."""
+    i, j = ridge_points
+    p_i, p_j = vor.points[i], vor.points[j]
+    dist = np.linalg.norm(p_j - p_i)
+    avg_diam = 0.5 * (particle_diameters[i] + particle_diameters[j])
+    return dist >= (avg_diam + passage_offset)
+
+def _in_central_box(pt, box_size):
+    """Check if a 2D point is inside the central box [-Lx/2,Lx/2] x [-Ly/2,Ly/2]."""
+    Lx, Ly = box_size
+    return (-0.5*Lx <= pt[0] <= 0.5*Lx) and (-0.5*Ly <= pt[1] <= 0.5*Ly)
+
+def _edge_midpoint(v1, v2):
+    return 0.5*(v1 + v2)
+
+def _touches_both_sides(coords, L, margin=1e-6):
+    """
+    Simple spanning heuristic along one axis:
+    returns True if the set has points near both the -L/2 and +L/2 sides.
+    """
+    if len(coords) == 0:
+        return False
+    xs = coords
+    left = np.any(xs <= -0.5*L + margin)
+    right = np.any(xs >=  0.5*L - margin)
+    return left and right
+
+def _is_percolating_cluster(verts_xy, box_size, margin=1e-6):
+    """
+    Heuristic percolation test on a torus: if a cluster has vertices that
+    touch both left & right or both bottom & top boundaries, mark as percolating.
+    This catches most wrapping clusters when using the 3x3 replication trick.
+    """
+    Lx, Ly = box_size
+    xs = verts_xy[:,0]
+    ys = verts_xy[:,1]
+    span_x = _touches_both_sides(xs, Lx, margin)
+    span_y = _touches_both_sides(ys, Ly, margin)
+    return span_x or span_y
+
+def compute_mean_cluster_size(vor, particle_diameters, box_size, passage_offset=0.701):
+    """
+    Build the graph of Voronoi vertices connected by 'connected' ridges (your blue edges),
+    but only keep ridges whose midpoints lie inside the central box. Then compute:
+
+      - p: fraction of connected ridges among ALL finite ridges whose midpoints
+           are inside the central box (connected + disconnected).
+      - S(p,L): mean cluster size of the CONNECTED-edge graph, excluding any
+                percolating component(s), using S = (sum s^2 over finite comps)/E.
+
+    Returns
+    -------
+    results : dict with keys
+        'p' : float
+        'S' : float
+        'num_connected_edges' : int
+        'num_total_edges' : int
+        'num_components' : int  (all components made of connected edges)
+        'num_finite_components' : int (after excluding percolating)
+        'percolating_components' : list of component indices flagged
+    """
+    Lx, Ly = box_size
+    verts = vor.vertices  # (M,2)
+
+    # Map each used Voronoi vertex to a compact index we will use in the graph
+    vertex_id_map = {}
+    next_vid = 0
+
+    # Adjacency: edge list between vertex IDs, and bookkeeping for cluster sizes
+    edges_connected = []        # list of (u,v) for connected (blue) ridges
+    edges_all_midbox = 0        # all finite ridges with midpoint inside central box
+    edges_connected_count = 0   # connected ones among those
+
+    # We will also keep the (wrapped) coordinates of vertices used in the graph
+    used_vertex_coords = {}
+
+    # Helper to wrap a vertex into the central box (consistent with your plot bounds)
+    def wrap_into_box(pt):
+        x, y = pt
+        # box centered at (0,0), range [-L/2, L/2]
+        x = ((x + 0.5*Lx) % Lx) - 0.5*Lx
+        y = ((y + 0.5*Ly) % Ly) - 0.5*Ly
+        return np.array([x, y], dtype=float)
+
+    # Build edges from Voronoi finite ridges whose midpoint is inside the central box
+    for ridge_vertices, ridge_points in zip(vor.ridge_vertices, vor.ridge_points):
+        rv = np.asarray(ridge_vertices)
+        if np.any(rv < 0):
+            # Skip infinite ridges
+            continue
+
+        v1 = verts[rv[0]]
+        v2 = verts[rv[1]]
+
+        # Only keep ridges whose midpoint lies inside the central box
+        mid = _edge_midpoint(v1, v2)
+        if not _in_central_box(wrap_into_box(mid), box_size):
+            continue
+
+        edges_all_midbox += 1
+
+        # Connectivity per passage rule (your "blue edge" check)
+        is_conn = _edge_is_connected(vor, ridge_points, particle_diameters, passage_offset)
+        if is_conn:
+            # Register vertices (wrapped)
+            for orig_vid in (rv[0], rv[1]):
+                if orig_vid not in vertex_id_map:
+                    vertex_id_map[orig_vid] = next_vid
+                    used_vertex_coords[next_vid] = wrap_into_box(verts[orig_vid])
+                    next_vid += 1
+            u = vertex_id_map[rv[0]]
+            v = vertex_id_map[rv[1]]
+            edges_connected.append((u, v))
+            edges_connected_count += 1
+
+    # Compute fraction p over finite mid-box ridges
+    p = (edges_connected_count / edges_all_midbox) if edges_all_midbox > 0 else 0.0
+
+    # If no connected edges, S = 0 by definition here
+    if edges_connected_count == 0:
+        return {
+            'p': p,
+            'S': 0.0,
+            'num_connected_edges': 0,
+            'num_total_edges': edges_all_midbox,
+            'num_components': 0,
+            'num_finite_components': 0,
+            'percolating_components': []
+        }
+
+    # Build adjacency lists for connected-edge graph
+    Nverts = next_vid
+    adj = [[] for _ in range(Nverts)]
+    for u, v in edges_connected:
+        adj[u].append(v)
+        adj[v].append(u)
+
+    # Find connected components (BFS/DFS) over vertex graph,
+    # but we need sizes in *edges*. We'll count edges per component.
+    visited = np.zeros(Nverts, dtype=bool)
+    comp_indices = np.full(Nverts, -1, dtype=int)
+    components = []  # each item: dict with 'verts', 'edges', 'coords'
+
+    for start in range(Nverts):
+        if visited[start]:
+            continue
+        # BFS
+        queue = deque([start])
+        visited[start] = True
+        this_verts = []
+        this_edges = 0
+        while queue:
+            u = queue.popleft()
+            comp_indices[u] = len(components)
+            this_verts.append(u)
+            # count edges incident to u; we'll divide by 2 later
+            this_edges += len(adj[u])
+            for v in adj[u]:
+                if not visited[v]:
+                    visited[v] = True
+                    queue.append(v)
+        # Each undirected edge counted twice above
+        this_edges //= 2
+
+        coords = np.vstack([used_vertex_coords[v] for v in this_verts]) if this_verts else np.empty((0,2))
+        components.append({'verts': this_verts, 'edges': this_edges, 'coords': coords})
+
+    # Identify percolating components via boundary-touch heuristic
+    percolating_idx = []
+    for k, comp in enumerate(components):
+        if comp['edges'] == 0 or comp['coords'].size == 0:
+            continue
+        if _is_percolating_cluster(comp['coords'], box_size, margin=1e-6):
+            percolating_idx.append(k)
+
+    # Compute S = (sum s^2 over finite comps)/E, exclude percolating comps
+    E = edges_connected_count
+    s2_sum = 0
+    finite_count = 0
+    for k, comp in enumerate(components):
+        if k in percolating_idx:
+            continue
+        s = comp['edges']
+        if s > 0:
+            s2_sum += s * s
+            finite_count += 1
+
+    S = (s2_sum / E) if E > 0 else 0.0
+
+    return {
+        'p': p,
+        'S': float(S),
+        'num_connected_edges': int(edges_connected_count),
+        'num_total_edges': int(edges_all_midbox),
+        'num_components': len(components),
+        'num_finite_components': finite_count,
+        'percolating_components': percolating_idx
+    }
+
+
+# Usage
+dump_file = "dump.lammpstrj"
+coordinates, diameters, box_size, ids = read_lammps_dump_last_frame(dump_file)
+replicated_coordinates = replicate_coordinates_pbc(coordinates, box_size, replication=3)
+replicated_ids = np.tile(ids, 9)  # Replicate IDs for debugging
+voronoi_diagram = voronoi_tessellation_2d(replicated_coordinates)
+plot_voronoi_with_edge_styles(voronoi_diagram, particle_diameters=np.tile(diameters, 9), ids=replicated_ids, box_size=box_size[:2], save_filename="voroni.pdf", figsize=(10, 10))
+
+
+# After you've built voronoi_diagram and particle_diameters, call:
+results = compute_mean_cluster_size(
+    vor=voronoi_diagram,
+    particle_diameters=np.tile(diameters, 9),  # since you replicated 3×3
+    box_size=box_size[:2],
+    passage_offset=0.701  # your same threshold tweak
+)
+
+print(f"p (fraction of connected edges): {results['p']:.4f}")
+print(f"S (mean cluster size, finite clusters only): {results['S']:.4f}")
+print(f"Connected edges: {results['num_connected_edges']} / Total mid-box finite ridges: {results['num_total_edges']}")
+print(f"Components (all / finite-only): {results['num_components']} / {results['num_finite_components']}")
+print(f"Percolating component indices (excluded): {results['percolating_components']}")
